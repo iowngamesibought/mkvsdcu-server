@@ -677,8 +677,12 @@ mod tests {
         // look like a replay and silently count nothing.
         let dir = directory();
         let store = IdentityStore::open(dir.clone()).unwrap();
-        let a = store.profile_for_ticket(&ticket(b"Synthetic_A", 1)).unwrap();
-        let b = store.profile_for_ticket(&ticket(b"Synthetic_B", 1)).unwrap();
+        let a = store
+            .profile_for_ticket(&ticket(b"Synthetic_A", 1))
+            .unwrap();
+        let b = store
+            .profile_for_ticket(&ticket(b"Synthetic_B", 1))
+            .unwrap();
         let first = store.reserve_generations(16).unwrap();
         assert!(
             first >= GENERATION_FLOOR,
