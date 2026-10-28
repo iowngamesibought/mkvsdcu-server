@@ -1,0 +1,48 @@
+# mkvsdcu-server config. Copy to mkvsdcu-server.toml; paths are relative to this
+# file. See README.md.
+#
+# Every bind address must be one the console can reach. The loopback addresses
+# below are placeholders for a local check only: a console cannot reach them.
+
+# The game's chat secret, taken from your own copy of the game. The chat
+# handshake and the result listener both authenticate with it, and neither
+# works without the real value. AGENTS.md explains how to obtain it. Keep it in
+# this local file only: never in notes, issues or commits.
+[peerchat]
+bind = "127.0.0.1:6667"
+title_secret = "CHANGE-ME"
+
+# The first probe of the online flow.
+[availability]
+bind = "127.0.0.1:27900"
+
+# Login, over the legacy TLS the client requires.
+[auth]
+bind = "127.0.0.1:443"
+max_request_bytes = 65536
+
+# The player session every later service checks back against.
+[gp]
+bind = "127.0.0.1:29900"
+
+# The player-history read the title makes before chat.
+[stats]
+bind = "127.0.0.1:80"
+
+# Optional: resolves an opponent's nickname during a challenge. A match will
+# not start without it.
+[gpsp]
+bind = "127.0.0.1:29901"
+
+# Optional: introduces two consoles to each other. Not a gameplay relay.
+[natneg]
+bind = "127.0.0.1:27901"
+
+# Optional: authenticated result ingestion. Raw reports are not stored.
+[gstats]
+bind = "127.0.0.1:29920"
+
+# Optional: durable player names and counters. Put it under game/, which is
+# git-ignored, because it is derived from play on your own copy.
+[identity]
+storage_dir = "game/players"

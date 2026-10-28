@@ -1,0 +1,20 @@
+# Example native dependency defaults. Copy to .cargo/config.toml and set
+# OPENSSL_DIR to your own static OpenSSL build.
+# Machine-local native dependency defaults. A real OPENSSL_DIR environment
+# variable takes precedence (Cargo does not override existing variables).
+# The library is an OpenSSL 3.5.8 MSVC static build with
+# SSL3 / SSL3-method / weak ciphers enabled and the legacy provider built in.
+[build]
+# The workspace lives on a network share; incremental artifacts can fail to
+# finalize there (os error 5) and are not needed for correctness.
+incremental = false
+
+[target.x86_64-pc-windows-msvc]
+# The prebuilt OpenSSL static libraries do not ship ossl_static.pdb next to
+# every object; LNK4099 is noise for this local build, not a code diagnostic.
+rustflags = ["-C", "link-arg=/IGNORE:4099"]
+
+[env]
+OPENSSL_DIR = "CHANGE-ME-static-openssl-install-dir"
+OPENSSL_STATIC = "1"
+OPENSSL_NO_VENDOR = "1"

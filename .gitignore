@@ -1,0 +1,38 @@
+# Your own game files, anything derived from them, and local settings:
+# never commit them.
+game/
+# Legacy local notes folder, kept ignored so older checkouts stay safe.
+runtime/
+# Every local config; only the example is published.
+mkvsdcu-server*.toml
+!mkvsdcu-server.example.toml
+# Build output.
+target/
+# Machine-local native build paths; only the example is published.
+.cargo/config.toml
+!.cargo/config.example.toml
+# Local agent settings.
+.claude/settings.local.json
+.local/
+# Secrets and local environment.
+.env
+.env.*
+# Logs, captures and databases: all of these can carry player or network data.
+*.log
+*.pcap
+*.pcapng
+*.sqlite*
+*.db
+__pycache__/
+*.pyc
+
+# Client content formats. The server reads no game file at runtime, but these
+# must never enter the public tree if an operator keeps inputs nearby.
+*.BIN
+*.SELF
+*.PKG
+*.ELF
+*.ISO
+*.7z
+*.rar
+*.zip

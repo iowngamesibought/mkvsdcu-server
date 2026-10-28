@@ -1,0 +1,12 @@
+[package]
+name = "mkvsdcu-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+md5.workspace = true
+
+[lints]
+workspace = true
