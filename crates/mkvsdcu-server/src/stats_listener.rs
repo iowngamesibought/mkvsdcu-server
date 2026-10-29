@@ -246,7 +246,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&directory).unwrap();
         std::fs::write(directory.join("state.toml"),
-            "version=1\n[outcomes]\n[players.testplayer]\nprofile_id=7\nname='TestPlayer'\nwins=3\nlosses=1\ndisconnects=1\ngames=4\nstreak=2\nbest_streak=3\n").unwrap();
+            "version=1\n[players.testplayer]\nprofile_id=7\nname='TestPlayer'\nwins=3\nlosses=1\ndisconnects=1\ngames=4\nstreak=2\nbest_streak=3\n").unwrap();
         let store = Arc::new(IdentityStore::open(directory.clone()).unwrap());
         for target in [
             stats::LEADERBOARD_PATH.to_owned(),

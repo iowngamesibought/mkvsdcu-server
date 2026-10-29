@@ -74,7 +74,7 @@ Other commands:
 
 Players meet in a room and challenge each other through room metadata and a pair of peer messages. The server resolves each side's nickname to a profile, relays the exchange, then introduces the two consoles by NAT negotiation. **The match itself is played directly between the two consoles**; this server only introduces them and records what they report afterwards.
 
-A result is written only once **both** consoles describe the same outcome. If one goes silent, the single account it did receive is written after a short window. If the two disagree, nothing is written, because nothing here can decide which is right. Driving that queue is lazy: it advances on session events, so a result that looks stuck is written as soon as either player starts another session.
+A result counts only when **both** consoles describe the same outcome: it then becomes a change to both players' records and nothing else is kept about the match. If the two disagree, or if one goes silent and the other's account waits out a short window, the match is dropped and no record moves — there is nothing here that could decide between them, and one console's word is not enough. Driving that queue is lazy: it advances on session events, so a result that looks stuck lands as soon as either player starts another session. Results waiting at the moment the server stops are lost with it; a match either counts in full or not at all.
 
 Ranking is a local policy, not a reconstruction of the original service: wins descending, then losses and disconnects ascending, then name.
 

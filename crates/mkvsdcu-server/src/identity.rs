@@ -9,11 +9,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 const MAX_TICKET: usize = 8192;
-/// Generations start above anything a build without a durable counter could
-/// have issued, so a fresh counter cannot collide with existing markers.
-const GENERATION_FLOOR: u64 = 1_000_000;
 const MAX_PROFILES: usize = 10000;
-const MAX_MARKERS: usize = 10000;
 const MAX_STATE: u64 = 8 * 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -28,33 +24,23 @@ pub struct PlayerRow {
     pub streak: u32,
     pub best_streak: u32,
 }
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-struct Outcome {
-    winner: u32,
-    loser: u32,
-    disconnect: Option<u32>,
-}
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+/// A match leaves nothing behind but the counters it moved. Earlier builds
+/// also kept one marker per committed match and a durable generation counter
+/// to key those markers by; both existed only to stop a result being counted
+/// twice, which the pending-result queue in `matches` now guarantees. Those
+/// fields are not accepted: a store written by such a build fails to open
+/// rather than being silently rewritten.
 struct State {
     version: u32,
     players: BTreeMap<String, PlayerRow>,
-    outcomes: BTreeMap<String, Outcome>,
-    /// The next unused match generation. Durable because the markers that
-    /// deduplicate committed results are derived from it: an in-memory
-    /// counter would restart at the same numbers after a restart and every
-    /// result would be discarded as a replay of an older match.
-    #[serde(default)]
-    next_generation: u64,
 }
 impl Default for State {
     fn default() -> Self {
         Self {
             version: 1,
             players: BTreeMap::new(),
-            outcomes: BTreeMap::new(),
-            next_generation: 0,
         }
     }
 }
@@ -192,73 +178,27 @@ impl IdentityStore {
         });
         Ok(rows)
     }
-    /// Commits both players and the dedup marker together. Caller must establish
-    /// authoritative outcome and match identity; this does not interpret reports.
-    /// Full marker capacity fails closed instead of evicting replay protection.
-    /// Reserve a block of match generations and return the first of them.
+    /// Move both players' counters by one decided result, in one transaction.
     ///
-    /// Generations key the durable markers that stop a result being counted
-    /// twice, so they must never repeat across restarts. A block is reserved
-    /// once at start-up rather than persisting a number per match. Unused
-    /// numbers in a block are simply skipped by the next start.
+    /// The result itself is not recorded: a match leaves only the counter
+    /// changes it caused. Nothing here can therefore tell a second call apart
+    /// from a second match, so the caller owns at-most-once. The queue in
+    /// `matches` hands each decided result over once and only re-offers it if
+    /// this call fails, which is what makes the retry safe.
     ///
-    /// The floor clears generations issued before this counter existed, whose
-    /// markers are already in the store and whose values cannot be recovered
-    /// from them.
-    pub fn reserve_generations(&self, block: u64) -> Result<u64, String> {
-        if block == 0 {
-            return Err("generation block must not be zero".into());
-        }
-        let mut current = self
-            .state
-            .lock()
-            .map_err(|_| "identity store lock failed")?;
-        let base = current.next_generation.max(GENERATION_FLOOR);
-        let next = base
-            .checked_add(block)
-            .ok_or("match generations exhausted")?;
-        let mut reserved = current.clone();
-        reserved.next_generation = next;
-        self.persist(&reserved)?;
-        *current = reserved;
-        Ok(base)
-    }
-
+    /// The caller must also establish the authoritative outcome; this does not
+    /// interpret reports.
     pub fn apply_outcome(
         &self,
-        match_key: &str,
         winner: u32,
         loser: u32,
         disconnect: Option<u32>,
-    ) -> Result<bool, String> {
-        if match_key.is_empty()
-            || match_key.len() > 256
-            || !match_key.is_ascii()
-            || match_key.bytes().any(|b| b.is_ascii_control())
-        {
-            return Err("invalid match identity".into());
-        }
-        let outcome = Outcome {
-            winner,
-            loser,
-            disconnect,
-        };
+    ) -> Result<(), String> {
         let mut current = self
             .state
             .lock()
             .map_err(|_| "identity store lock failed")?;
-        validate_outcome(&outcome, &current)?;
-        let key = hex(&openssl::sha::sha256(match_key.as_bytes()));
-        if let Some(previous) = current.outcomes.get(&key) {
-            return if *previous == outcome {
-                Ok(false)
-            } else {
-                Err("conflicting outcome for committed match".into())
-            };
-        }
-        if current.outcomes.len() >= MAX_MARKERS {
-            return Err("match deduplication capacity exceeded".into());
-        }
+        validate_participants(winner, loser, disconnect, &current)?;
         let mut next = current.clone();
         for row in next
             .players
@@ -278,10 +218,9 @@ impl IdentityStore {
                 row.disconnects = increment(row.disconnects)?;
             }
         }
-        next.outcomes.insert(key, outcome);
         self.persist(&next)?;
         *current = next;
-        Ok(true)
+        Ok(())
     }
     fn persist(&self, state: &State) -> Result<(), String> {
         let body = toml::to_string(state).map_err(|_| "cannot serialize identity state")?;
@@ -330,24 +269,24 @@ fn validate_name(name: &str) -> Result<(), String> {
     }
     Ok(())
 }
-fn validate_outcome(outcome: &Outcome, state: &State) -> Result<(), String> {
-    if outcome.winner == outcome.loser
-        || ![outcome.winner, outcome.loser]
+fn validate_participants(
+    winner: u32,
+    loser: u32,
+    disconnect: Option<u32>,
+    state: &State,
+) -> Result<(), String> {
+    if winner == loser
+        || ![winner, loser]
             .iter()
             .all(|id| state.players.values().any(|p| p.profile_id == *id))
-        || outcome
-            .disconnect
-            .is_some_and(|id| id != outcome.winner && id != outcome.loser)
+        || disconnect.is_some_and(|id| id != winner && id != loser)
     {
         return Err("invalid outcome participants".into());
     }
     Ok(())
 }
 fn validate_state(state: &State) -> Result<(), String> {
-    if state.version != 1
-        || state.players.len() > MAX_PROFILES
-        || state.outcomes.len() > MAX_MARKERS
-    {
+    if state.version != 1 || state.players.len() > MAX_PROFILES {
         return Err("invalid identity state capacity/version".into());
     }
     let mut ids = BTreeSet::new();
@@ -375,16 +314,6 @@ fn validate_state(state: &State) -> Result<(), String> {
         {
             return Err("invalid player aggregate".into());
         }
-    }
-    for (key, outcome) in &state.outcomes {
-        if key.len() != 64
-            || !key
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        {
-            return Err("invalid match marker".into());
-        }
-        validate_outcome(outcome, state)?;
     }
     Ok(())
 }
@@ -520,7 +449,7 @@ mod tests {
         std::env::temp_dir().join(format!("identity-test-{}", hex(&random)))
     }
     #[test]
-    fn name_identity_and_outcomes_survive_restart() {
+    fn name_identity_and_counters_survive_restart() {
         let dir = directory();
         let store = IdentityStore::open(dir.clone()).unwrap();
         let a = store
@@ -537,11 +466,11 @@ mod tests {
             .unwrap();
         assert_ne!(a, b);
         assert!(IdentityStore::open(dir.clone()).is_err());
-        assert!(store.apply_outcome("first", a, b, None).unwrap());
-        assert!(!store.apply_outcome("first", a, b, None).unwrap());
-        assert!(store.apply_outcome("first", b, a, None).is_err());
-        assert!(store.apply_outcome("second", a, b, Some(b)).unwrap());
-        assert!(store.apply_outcome("third", b, a, None).unwrap());
+        store.apply_outcome(a, b, None).unwrap();
+        // A profile that does not exist is not a participant.
+        assert!(store.apply_outcome(a, 999, None).is_err());
+        store.apply_outcome(a, b, Some(b)).unwrap();
+        store.apply_outcome(b, a, None).unwrap();
         let winner = store.player(a).unwrap().unwrap();
         let loser = store.player(b).unwrap().unwrap();
         assert_eq!(
@@ -580,26 +509,25 @@ mod tests {
         let reopened = IdentityStore::open(dir.clone()).unwrap();
         assert_eq!(reopened.player(a).unwrap(), Some(winner));
         assert_eq!(reopened.player(b).unwrap(), Some(loser));
-        assert!(!reopened.apply_outcome("second", a, b, Some(b)).unwrap());
         drop(reopened);
         fs::remove_dir_all(dir).unwrap();
     }
     #[test]
-    fn failed_transaction_changes_neither_player_nor_marker() {
+    fn failed_transaction_leaves_the_players_unchanged() {
         let dir = directory();
         let store = IdentityStore::open(dir.clone()).unwrap();
         let a = store.profile_for_ticket(&ticket(b"Alpha", 1)).unwrap();
         let b = store.profile_for_ticket(&ticket(b"Bravo", 1)).unwrap();
         let before = store.leaderboard().unwrap();
-        assert!(store.apply_outcome("invalid", a, 999, None).is_err());
+        assert!(store.apply_outcome(a, 999, None).is_err());
         // Force replacement failure after the transaction file is synced.
         fs::rename(dir.join("state.toml"), dir.join("saved.toml")).unwrap();
         fs::create_dir(dir.join("state.toml")).unwrap();
-        assert!(store.apply_outcome("retry", a, b, None).is_err());
+        assert!(store.apply_outcome(a, b, None).is_err());
         assert_eq!(store.leaderboard().unwrap(), before);
         fs::remove_dir(dir.join("state.toml")).unwrap();
         fs::rename(dir.join("saved.toml"), dir.join("state.toml")).unwrap();
-        assert!(store.apply_outcome("retry", a, b, None).unwrap());
+        store.apply_outcome(a, b, None).unwrap();
         drop(store);
         let reopened = IdentityStore::open(dir.clone()).unwrap();
         assert_eq!(reopened.player(a).unwrap().unwrap().wins, 1);
@@ -643,10 +571,24 @@ mod tests {
         fs::remove_file(dir.join("old.profile")).unwrap();
         fs::write(dir.join("state.toml"), "invalid").unwrap();
         assert!(IdentityStore::open(dir.clone()).is_err());
+        // A store from a build that recorded each match is refused rather
+        // than quietly rewritten without those records.
+        fs::write(
+            dir.join("state.toml"),
+            format!(
+                "version = 1\nnext_generation = 1000016\n\n[outcomes.{}]\n\
+winner = 1\nloser = 2\n",
+                "ab".repeat(32)
+            ),
+        )
+        .unwrap();
+        assert!(IdentityStore::open(dir.clone()).is_err());
         fs::remove_dir_all(dir).unwrap();
     }
     #[test]
-    fn concurrent_duplicate_is_committed_once() {
+    fn concurrent_results_each_count_exactly_once() {
+        // Every call is a distinct match here, so none may be lost to another
+        // thread's read-modify-write and none may be applied twice.
         let dir = directory();
         let store = std::sync::Arc::new(IdentityStore::open(dir.clone()).unwrap());
         let a = store.profile_for_ticket(&ticket(b"Alpha", 1)).unwrap();
@@ -654,66 +596,15 @@ mod tests {
         let threads: Vec<_> = (0..8)
             .map(|_| {
                 let store = store.clone();
-                std::thread::spawn(move || store.apply_outcome("same", a, b, None).unwrap())
+                std::thread::spawn(move || store.apply_outcome(a, b, None).unwrap())
             })
             .collect();
-        assert_eq!(
-            threads
-                .into_iter()
-                .map(|h| usize::from(h.join().unwrap()))
-                .sum::<usize>(),
-            1
-        );
-        assert_eq!(store.player(a).unwrap().unwrap().wins, 1);
-        assert_eq!(store.player(b).unwrap().unwrap().losses, 1);
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(store.player(a).unwrap().unwrap().wins, 8);
+        assert_eq!(store.player(b).unwrap().unwrap().losses, 8);
         drop(store);
         fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn generations_never_repeat_across_a_restart() {
-        // A result is deduplicated by its generation, so an in-memory counter
-        // that restarts at the same numbers makes every result after a restart
-        // look like a replay and silently count nothing.
-        let dir = directory();
-        let store = IdentityStore::open(dir.clone()).unwrap();
-        let a = store
-            .profile_for_ticket(&ticket(b"Synthetic_A", 1))
-            .unwrap();
-        let b = store
-            .profile_for_ticket(&ticket(b"Synthetic_B", 1))
-            .unwrap();
-        let first = store.reserve_generations(16).unwrap();
-        assert!(
-            first >= GENERATION_FLOOR,
-            "a fresh counter must clear generations issued before it existed"
-        );
-        assert!(
-            store
-                .apply_outcome(&format!("generation:{first}"), a, b, None)
-                .unwrap()
-        );
-        assert_eq!(store.player(a).unwrap().unwrap().wins, 1);
-        drop(store);
-
-        // Restart: the next run must not reissue any number from that block.
-        let store = IdentityStore::open(dir.clone()).unwrap();
-        let second = store.reserve_generations(16).unwrap();
-        assert!(second >= first + 16, "{second} overlaps the first block");
-        assert!(
-            store
-                .apply_outcome(&format!("generation:{second}"), a, b, None)
-                .unwrap(),
-            "a result after a restart must be counted, not deduplicated"
-        );
-        assert_eq!(store.player(a).unwrap().unwrap().wins, 2);
-        // A genuine replay of the same generation is still a no-op.
-        assert!(
-            !store
-                .apply_outcome(&format!("generation:{second}"), a, b, None)
-                .unwrap()
-        );
-        assert_eq!(store.player(a).unwrap().unwrap().wins, 2);
-        assert!(store.reserve_generations(0).is_err());
     }
 }

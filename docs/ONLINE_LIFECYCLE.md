@@ -40,7 +40,7 @@ path are implemented against the title's own code and await a two-console run.
    revision. Reconnect must not create another lifetime account or reset its history.
 10. **Logout and recovery.** Remove online membership, cancel stale negotiations,
     expire login credentials, and retain bounded proof material long enough to finish
-    legitimate pending results. Retain persistent profiles and bounded duplicate markers; no play history is stored.
+    legitimate pending results. Retain persistent profiles; no match records and no play history are stored.
 
 ## Statistics visible to the client
 
@@ -72,12 +72,38 @@ disconnects, games, streak and best streak. The numeric profile ID remains stabl
 Chat nickname decorations are not part of identity. Case-only name changes share
 a row; an actual rename is a future migration question.
 
-An accepted outcome updates both players and its duplicate marker in a single
-atomic transaction. Duplicate submissions do not update counters again; conflicting
-outcomes for the same key are rejected. There is no permanent raw report or play
-history. The current bounded store allows 10,000 profiles and 10,000 markers;
-when full it rejects new outcomes rather than silently removing replay protection.
-A safe expiry policy tied to a verified match lifecycle remains future work.
+An accepted outcome updates both players in a single atomic transaction, and
+leaves nothing else behind: no raw report, no play history and no record of the
+match. Exactly-once therefore rests on the in-memory pending-result queue rather
+than on durable storage. A pairing's decided result is handed to one writer at a
+time, is only offered again if that write fails, and is retired once it
+succeeds; a replayed or contradicting report resolves to the same pairing and is
+dropped.
+
+A pairing counts only on agreement. Two peers describing the same outcome become
+one counter change; peers that disagree are dropped; and a pairing whose second
+peer has not reported within the agreement window is dropped too, with nothing
+written for the peer that did report. Lateness is decided both when a report
+arrives and when the queue is swept, so whether a match counts never depends on
+sweep timing.
+
+Dropping a match because one console went quiet is unfair to the console that
+did report, and that is an accepted trade. Agreement is a property the server
+can check; fairness to a single account is not, and counting one account would
+let a console claim a win by making sure its opponent never answered. The cost
+falls on an honest player only as a match that counts for nobody, and a player
+whose opponent keeps dropping can see that and stop challenging them — the
+title's own ignore feature covers the social side of this, so the server does
+not need a trust score or a penalty of its own.
+
+Consistency across a restart is deliberately not attempted. Nothing durable
+remembers a match, so a result still pending when the process stops is lost, and
+a report can only be attributed to a pairing this process watched begin — a
+restart drops the pairing and any report for it. What is guaranteed is that a
+player's counters only ever move by whole agreed matches: never twice for one
+match, and never by a partial or one-sided account. The store is bounded at
+10,000 player rows. A safe expiry policy tied to a verified match lifecycle
+remains future work.
 
 Leaderboard policy: wins descending, losses ascending, disconnects ascending,
 then case-insensitive account name. Displayed skill is the win count. These are local
@@ -95,11 +121,11 @@ authenticates, the reporting player proves ownership of a verified login session
 from the observed source, and the match it names is a pairing the server watched
 two room members announce. The report's participants must be that pairing.
 
-The commit is keyed by the server's own generation for that pairing, not by the
-title's `b_mid`. That is deliberate: `b_mid` reuse across a rematch is not
-disproved, while a generation is never reused, so each match counts once whether
-or not the title reuses its identity, and retries or both consoles reporting
-collapse to one commit.
+A pending result is tracked by the server's own generation for that pairing, not
+by the title's `b_mid`. That is deliberate: `b_mid` reuse across a rematch is not
+disproved, while a generation is issued once per pairing, so each match counts
+once whether or not the title reuses its identity, and retries or both consoles
+reporting collapse to one counter change.
 
 Outcome rules, stated because the title settles only part of this:
 
@@ -108,12 +134,15 @@ Outcome rules, stated because the title settles only part of this:
 - A disconnect credits the reporter and records the drop against the other
   player. The title marks that a disconnect happened without naming whose it
   was; attributing it to the side that did not report is this server's rule.
+  Note that this decoding rarely decides anything in practice: both peers must
+  still describe the same outcome, and a console that dropped usually cannot
+  report at all, so most disconnected matches now count for neither player.
 - Otherwise the player with the higher round-win counter wins. Equal counters
   decide nothing and write nothing.
 
 Two questions remain open and are not papered over. Whether the round counter
 resets per match or accumulates across a rematch is not established from the
-code; generation keying makes that irrelevant to counting once, but a cumulative
+code; per-pairing generations make that irrelevant to counting once, but a cumulative
 counter would make the recorded margin wrong. And ranked versus private
 eligibility is unresolved: the result producer emits `game_type` 0 and
 `rank_mode` 1 for every match it sends, which is a wire fact rather than

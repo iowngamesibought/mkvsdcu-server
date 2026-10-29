@@ -146,6 +146,7 @@ Follow the [dns-override](.claude/skills/dns-override/SKILL.md) skill to point e
 | Negotiation pairs but no result arrives | The consoles could not reach each other directly. This server does not relay gameplay. |
 | `[gstats] ... peers disagree; nothing recorded` | The two consoles described different outcomes. Nothing here can decide between them, so nothing is written. |
 | `[gstats] ... report ... ignored; not awaiting one` | The report did not belong to a pairing this server watched begin, or that pairing was already settled. |
+| `[match] ... only profile <id> reported; nothing recorded`, or `[gstats] ... is too late` | One console reported and its opponent did not do so within the agreement window. A match counts only when both describe the same outcome, so neither player's record moves. A result still pending when the server is stopped is lost the same way. |
 | Players vanish from a room after a match | The chat listener owes the client a fresh member list when it leaves quiet mode. If that path has been changed, re-check it. |
 
 ## Boundaries and publication

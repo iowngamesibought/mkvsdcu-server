@@ -8,9 +8,14 @@
 //!
 //! Each player keeps its *own* match identity, so there is no shared value to
 //! group them by. A session therefore records both identities and the server
-//! gives every pairing its own generation, which is what a committed result is
-//! keyed by. That stays correct whether or not the title ever reuses an
+//! gives every pairing its own generation, which is how a pending result is
+//! identified here. That stays correct whether or not the title ever reuses an
 //! identity.
+//!
+//! Nothing durable records that a match happened: a decided result becomes a
+//! change to both players' counters and nothing else. The queue below is
+//! therefore what guarantees a result is applied exactly once, by handing it
+//! to one writer at a time and only taking it back if that write fails.
 //!
 //! What `answer` means is not established, so a session is recorded for every
 //! answered challenge and the value is only logged. A declined challenge simply
@@ -29,9 +34,10 @@ const CHALLENGE_TTL: Duration = Duration::from_secs(2 * 60);
 const REPORT_GRACE: Duration = Duration::from_secs(10 * 60);
 /// How long a session with no result at all is kept before it is dropped.
 const SESSION_TTL: Duration = Duration::from_secs(60 * 60);
-/// How long a pairing with one report waits for the other side. When it
-/// closes, the single report is written on its own: a console that never
-/// reports must not cost its opponent the result.
+/// How long a pairing with one report waits for the other side. When it closes
+/// the pairing is abandoned and nothing is written: only two peers describing
+/// the same result move a player's counters, so one account on its own is not
+/// enough however long it waits.
 const AGREEMENT_WINDOW: Duration = Duration::from_secs(60);
 /// Both participants, and no more: a third report cannot exist.
 const MAX_REPORTS: usize = 2;
@@ -59,6 +65,10 @@ pub enum Verdict {
     /// The peers described different results. The pairing is abandoned
     /// and nothing is written, because there is no basis to prefer one.
     Conflict,
+    /// One peer reported and its opponent did not do so in time, so the
+    /// pairing is abandoned with nothing written. A report that arrives after
+    /// the window has closed lands here too: it is no longer usable evidence.
+    Expired,
     /// Not a pairing awaiting a report: unknown, already decided, or
     /// from someone who did not play in it. The report is dropped.
     Ignored,
@@ -122,8 +132,8 @@ pub fn parse_peer_message(payload: &str) -> Option<PeerMessage> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Session {
-    /// Server-assigned identity, unique per pairing. A committed result is
-    /// keyed by this, never by an identity the title chose.
+    /// Server-assigned identity, unique per pairing in this run. A pending
+    /// result is tracked by this, never by an identity the title chose.
     pub generation: u64,
     /// Each player's own match identity, in the same order as `players`.
     pub match_ids: [String; 2],
@@ -163,6 +173,11 @@ struct Live {
     /// closing. Set before it is written, and kept until the write is
     /// confirmed, so a failed write is retried rather than lost.
     decided: Option<Outcome>,
+    /// Set while a caller holds this result to write it. The records keep no
+    /// trace of a match, so they cannot recognise the same result arriving
+    /// twice; this is what stops two concurrent flushes counting it twice.
+    /// Cleared by `release` when the write fails, so it is offered again.
+    writing: bool,
     /// Set once the result has been written, or once the pairing has been
     /// abandoned and never will be. The entry is kept for the report
     /// grace so replays resolve to it and are ignored, rather than
@@ -177,6 +192,8 @@ struct Inner {
     /// Outstanding challenges, keyed by the nickname that was challenged.
     pending: BTreeMap<String, Pending>,
     sessions: BTreeMap<u64, Live>,
+    /// In-memory only: a generation is never compared across runs, because a
+    /// pairing this process did not watch begin cannot be reported on anyway.
     next_generation: u64,
 }
 
@@ -194,17 +211,6 @@ impl std::fmt::Debug for Matches {
 impl Matches {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// Start issuing generations at `base`.
-    ///
-    /// Committed results are deduplicated by generation in durable storage,
-    /// so the counter must not restart at numbers a previous run already
-    /// used; the identity store reserves the base.
-    pub fn starting_at(base: u64) -> Self {
-        let this = Self::default();
-        this.lock().next_generation = base;
-        this
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -281,6 +287,7 @@ impl Matches {
                 ended_at: None,
                 reports: Vec::new(),
                 decided: None,
+                writing: false,
                 settled: false,
                 nicks: [sides[0].2.clone(), sides[1].2.clone()],
             },
@@ -348,6 +355,18 @@ impl Matches {
         if live.decided.is_some() {
             return Verdict::Ignored;
         }
+        // An account already here whose window has closed voids the pairing,
+        // whoever is calling now. Checked on arrival as well as in the sweep
+        // so lateness does not depend on whether a sweep happened to run.
+        if live
+            .reports
+            .iter()
+            .any(|seen| now.duration_since(seen.at) >= AGREEMENT_WINDOW)
+        {
+            live.settled = true;
+            live.ended_at = Some(now);
+            return Verdict::Expired;
+        }
         // A peer repeating itself is idempotent; a peer contradicting itself
         // is as unusable as two peers contradicting each other.
         if let Some(seen) = live.reports.iter().find(|r| r.reporter == reporter) {
@@ -383,23 +402,25 @@ impl Matches {
                 live.settled = true;
                 live.ended_at = Some(now);
             }
-            Verdict::Held | Verdict::Ignored => {}
+            Verdict::Held | Verdict::Expired | Verdict::Ignored => {}
         }
         verdict
     }
 
-    /// Every result that is determined but not yet written: pairings both
-    /// peers agreed on, and pairings whose agreement window has now closed
-    /// with only one peer heard from.
+    /// Every result two peers agreed on that is not yet written. Pairings
+    /// whose agreement window has closed with only one peer heard from are
+    /// abandoned here instead: nothing is written for them.
     ///
     /// Nothing here runs on a timer. This is driven by session events, so a
     /// held report is carried forward until the next challenge, answer,
     /// departure or report moves it along. A player whose result looks stuck
     /// can start another session, and that alone drives the old one in.
     ///
-    /// An entry stays here until `settle` confirms the write, so a write that
-    /// fails is attempted again on the next event instead of being lost. The
-    /// records key each result by generation, so a repeated write is a no-op.
+    /// Each result is handed out once. The records hold counters only, with
+    /// nothing to recognise a result they have already applied, so this is
+    /// the only thing standing between a second flush and a double count: an
+    /// entry returned here is claimed until `settle` confirms the write or
+    /// `release` gives it back for another attempt.
     pub fn take_due(&self) -> Vec<(u64, Outcome)> {
         self.take_due_at(Instant::now())
     }
@@ -409,18 +430,25 @@ impl Matches {
         let mut inner = self.lock();
         let mut due = Vec::new();
         for (generation, live) in inner.sessions.iter_mut() {
-            if live.settled {
+            if live.settled || live.writing {
                 continue;
             }
-            // A single account whose window has closed decides the result.
+            // One account whose opponent never answered for it is not a
+            // result. The pairing is dropped with the counters untouched.
             if live.decided.is_none()
                 && let [only] = live.reports.as_slice()
                 && now.duration_since(only.at) >= AGREEMENT_WINDOW
             {
-                live.decided = Some(only.outcome);
+                live.settled = true;
                 live.ended_at = Some(now);
+                println!(
+                    "[match] generation={generation} only profile {} reported; nothing recorded",
+                    only.reporter
+                );
+                continue;
             }
             if let Some(outcome) = live.decided {
+                live.writing = true;
                 due.push((*generation, outcome));
             }
         }
@@ -428,13 +456,23 @@ impl Matches {
         due
     }
 
-    /// Confirm that a decided result has been written. Until this is called
-    /// the result keeps coming back from `take_due`.
+    /// Confirm that a decided result has been written. The pairing is finished
+    /// and nothing is offered for it again.
     pub fn settle(&self, generation: u64) {
         let mut inner = self.lock();
         if let Some(live) = inner.sessions.get_mut(&generation) {
+            live.writing = false;
             live.settled = true;
             live.ended_at.get_or_insert_with(Instant::now);
+        }
+    }
+
+    /// Give a claimed result back unwritten. It becomes due again, so the next
+    /// session event retries it rather than losing it.
+    pub fn release(&self, generation: u64) {
+        let mut inner = self.lock();
+        if let Some(live) = inner.sessions.get_mut(&generation) {
+            live.writing = false;
         }
     }
 
@@ -478,11 +516,15 @@ impl Inner {
         self.pending
             .retain(|_, p| now.duration_since(p.at) < CHALLENGE_TTL);
         self.sessions.retain(|_, live| {
-            // A report that has not been written is never dropped for age.
-            // Nothing drives this on a timer, so the entry has to outlive
+            // An agreed result that has not been written is never dropped for
+            // age. Nothing drives this on a timer, so the entry has to outlive
             // the quiet period until some later event claims it. Capacity
             // still bounds the queue.
-            if !live.settled && (!live.reports.is_empty() || live.decided.is_some()) {
+            //
+            // A lone report is not protected: it is only usable until its
+            // window closes, and both ages below outlast that window, so
+            // ageing one out and expiring it come to the same thing.
+            if !live.settled && live.decided.is_some() {
                 return true;
             }
             match live.ended_at {
@@ -697,9 +739,12 @@ mod tests {
             matches.report(session.generation, 2, outcome),
             Verdict::Agreed(outcome)
         );
-        // It stays due until the write is confirmed, so a store failure
-        // is retried rather than dropped.
+        // It is handed to one writer: a second sweep must not offer the same
+        // result again, because nothing in the records would notice it twice.
         assert_eq!(matches.take_due(), vec![(session.generation, outcome)]);
+        assert!(matches.take_due().is_empty(), "claimed by the first sweep");
+        // A failed write hands it back, and then it is due again.
+        matches.release(session.generation);
         assert_eq!(matches.take_due(), vec![(session.generation, outcome)]);
         matches.settle(session.generation);
         assert!(matches.take_due().is_empty(), "written once");
@@ -758,25 +803,61 @@ mod tests {
     }
 
     #[test]
-    fn a_silent_opponent_does_not_cost_the_other_player_the_result() {
+    fn a_silent_opponent_voids_the_result_for_both_players() {
         let matches = Matches::new();
         let session = paired(&matches);
         let outcome = won_by(1, 2);
         matches.report(session.generation, 1, outcome);
-        // Before the window closes the result is still held.
+        // Before the window closes the one account is still held, waiting.
         assert!(matches.take_due().is_empty());
-        // Once it closes, the one account there is becomes due.
-        let due = matches.take_due_at(Instant::now() + AGREEMENT_WINDOW);
-        assert_eq!(due, vec![(session.generation, outcome)]);
-        // Confirming the write is what retires it; only then is it gone.
-        matches.settle(session.generation);
+        // When it closes the pairing is abandoned: one account is not a
+        // result, however long it waits, so nothing is ever due.
+        assert!(
+            matches
+                .take_due_at(Instant::now() + AGREEMENT_WINDOW)
+                .is_empty()
+        );
         assert!(
             matches
                 .take_due_at(Instant::now() + AGREEMENT_WINDOW * 3)
                 .is_empty()
         );
+        // And the opponent turning up afterwards cannot revive it.
         assert_eq!(
             matches.report(session.generation, 2, outcome),
+            Verdict::Ignored
+        );
+    }
+
+    #[test]
+    fn an_opponent_answering_after_the_window_is_too_late() {
+        let matches = Matches::new();
+        let session = paired(&matches);
+        let outcome = won_by(1, 2);
+        // No sweep runs in between, so arrival is what has to catch this:
+        // whether a result counts must not depend on a sweep's timing.
+        {
+            let mut inner = matches.lock();
+            let live = inner.sessions.get_mut(&session.generation).unwrap();
+            live.reports.push(Report {
+                reporter: 1,
+                outcome,
+                at: Instant::now() - AGREEMENT_WINDOW,
+            });
+        }
+        assert_eq!(
+            matches.report(session.generation, 2, outcome),
+            Verdict::Expired
+        );
+        assert!(matches.take_due().is_empty());
+        // The pairing is finished, so the late peer repeating itself, or the
+        // peer that was in time, both find nothing to report against.
+        assert_eq!(
+            matches.report(session.generation, 2, outcome),
+            Verdict::Ignored
+        );
+        assert_eq!(
+            matches.report(session.generation, 1, outcome),
             Verdict::Ignored
         );
     }
@@ -799,14 +880,15 @@ mod tests {
     }
 
     #[test]
-    fn a_held_report_survives_the_quiet_period_until_an_event_drives_it() {
+    fn an_agreed_result_survives_the_quiet_period_until_an_event_drives_it() {
         let matches = Matches::new();
         let session = paired(&matches);
         let outcome = won_by(1, 2);
         matches.report(session.generation, 1, outcome);
+        matches.report(session.generation, 2, outcome);
         // Both players leave, and far longer than the report grace passes with
-        // nothing happening. An unwritten report must not be aged out, since
-        // nothing drives the queue on a timer.
+        // nothing happening. An agreed result that was never written must not
+        // be aged out, since nothing drives the queue on a timer.
         matches.forget("p1");
         matches.forget("p2");
         let later = Instant::now() + REPORT_GRACE + SESSION_TTL;
@@ -814,11 +896,37 @@ mod tests {
             matches.take_due_at(later),
             vec![(session.generation, outcome)]
         );
-        // Still unwritten, so a second sweep after the same long silence
+        // Still unwritten, so once the writer hands it back a later sweep
         // offers it again rather than discarding it.
+        matches.release(session.generation);
         assert_eq!(
             matches.take_due_at(later),
             vec![(session.generation, outcome)]
+        );
+    }
+
+    #[test]
+    fn concurrent_sweeps_hand_one_result_to_one_writer() {
+        // Two listeners can flush at the same moment. The records cannot tell
+        // the same result apart from a second match, so exactly one sweep may
+        // come away with it.
+        let matches = std::sync::Arc::new(Matches::new());
+        let session = paired(&matches);
+        let outcome = won_by(1, 2);
+        matches.report(session.generation, 1, outcome);
+        matches.report(session.generation, 2, outcome);
+        let sweeps: Vec<_> = (0..8)
+            .map(|_| {
+                let matches = std::sync::Arc::clone(&matches);
+                std::thread::spawn(move || matches.take_due().len())
+            })
+            .collect();
+        assert_eq!(
+            sweeps
+                .into_iter()
+                .map(|sweep| sweep.join().unwrap())
+                .sum::<usize>(),
+            1
         );
     }
 }

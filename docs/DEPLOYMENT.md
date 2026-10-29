@@ -145,12 +145,16 @@ Where it stops says what failed:
 | `no partner for <address>` | One console negotiated alone for 30 seconds. Its opponent never started, or started a different match. |
 | `paired` but no `[gstats]` | The consoles could not reach each other directly. Expected when they are behind separate routers; this server does not relay gameplay. |
 | `result not recorded: ...` | The report arrived but could not be tied to a watched pairing. The message says which check failed. |
+| `only profile <id> reported; nothing recorded` | One console's account arrived and its opponent's did not, within the agreement window. A match counts only on agreement, so neither record moves. |
 
 ## Current deployment limits
 
 - No service supervision, restart policy, log rotation or deployment script.
 - A restart invalidates all sessions and tokens; a console has to log in again.
-  Player records survive, match pairings in progress do not.
+  Player records survive, match pairings in progress do not, and a result that
+  was decided but not yet written is lost with them. That is accepted: a match
+  moves both players' counters together or not at all, and nothing durable
+  records matches themselves.
 - No gameplay relay. If two consoles cannot reach each other after negotiation,
   the match cannot start; there is no fallback path.
 - No hardware acceptance for matchmaking or results. Treat a console run as

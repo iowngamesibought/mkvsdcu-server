@@ -116,35 +116,30 @@ fn outcome(report: &gstats::ResultSnapshot) -> Result<(u32, u32, Option<u32>), S
     }
 }
 
-/// Commit an accepted report against the pairing the server watched begin.
-/// Write a decided outcome. Returns whether this call was the one that
-/// changed the records; a repeat of the same generation is a no-op.
+/// Turn a decided outcome into the counter changes it means for both players.
+///
+/// The match itself is not recorded anywhere, so this must be called once per
+/// pairing; the queue is what guarantees that, by handing each result to one
+/// writer and only re-offering it if this fails.
 fn commit(
     store: &crate::identity::IdentityStore,
     generation: u64,
     outcome: Outcome,
-) -> Result<bool, String> {
-    // The generation, not the title's match identity, keys the record: a
-    // rematch may reuse that identity but never reuses a generation.
-    let committed = store.apply_outcome(
-        &format!("generation:{generation}"),
-        outcome.winner,
-        outcome.loser,
-        outcome.disconnect,
-    )?;
+) -> Result<(), String> {
+    store.apply_outcome(outcome.winner, outcome.loser, outcome.disconnect)?;
     println!(
-        "[gstats] generation={generation} committed={committed} winner={} loser={} disconnect={:?}",
+        "[gstats] generation={generation} committed=true winner={} loser={} disconnect={:?}",
         outcome.winner, outcome.loser, outcome.disconnect
     );
-    Ok(committed)
+    Ok(())
 }
 
-/// Write every result the queue has decided but not yet recorded.
+/// Apply every result the queue has decided but not yet applied.
 ///
 /// Driven by session events rather than a timer, so it is called wherever a
-/// pairing is created, answered or reported on. A result is only settled once
-/// the write is confirmed, so a transient store failure is retried on the
-/// next event instead of being lost.
+/// pairing is created, answered or reported on. The queue hands each result
+/// out once; a transient store failure gives it back, so it is retried on the
+/// next event instead of being lost or counted twice.
 pub fn flush_due_results(matches: &Matches, sessions: &crate::session::AuthSessions) {
     let due = matches.take_due();
     if due.is_empty() {
@@ -163,9 +158,10 @@ pub fn flush_due_results(matches: &Matches, sessions: &crate::session::AuthSessi
     };
     for (generation, outcome) in due {
         match commit(&store, generation, outcome) {
-            Ok(_) => matches.settle(generation),
-            // Left unsettled on purpose: the next event retries it.
+            Ok(()) => matches.settle(generation),
+            // Handed back on purpose: the next event retries it.
             Err(error) => {
+                matches.release(generation);
                 eprintln!("[gstats] generation={generation} not recorded, will retry: {error}")
             }
         }
@@ -213,6 +209,11 @@ fn record(
         Verdict::Conflict => {
             println!("[gstats] generation={generation} peers disagree; nothing recorded")
         }
+        Verdict::Expired => println!(
+            "[gstats] generation={generation} report from profile {} is too late; \
+the pairing expired without both peers, nothing recorded",
+            report.reporter
+        ),
         Verdict::Ignored => println!(
             "[gstats] generation={generation} report from profile {} ignored; not awaiting one",
             report.reporter

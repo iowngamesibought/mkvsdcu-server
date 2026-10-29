@@ -72,21 +72,27 @@ reason for a match that never starts.
   watched pairing. Participants in the report must be that pairing. Winner comes
   from the round counters; an abort credits the opponent of the profile the title
   blames; a disconnect credits the reporter and records the drop against the
-  other player. An undecided report writes nothing. Commits are keyed by
-  generation, so retries and both consoles reporting count once.
+  other player. An undecided report writes nothing. Only an agreement counts:
+  both consoles must describe the same outcome, and a pairing that disagrees,
+  or whose second console does not report within the agreement window, is
+  dropped with the counters untouched. An agreement becomes a counter change
+  and nothing else; the pending-result queue hands it to one writer, so retries
+  and both consoles reporting count once. A result still pending when the
+  process stops is lost, by design: a match counts in full or not at all.
 
 ## Validation
 
-122 tests pass: 54 protocol, 67 server, one SSL3 integration. Workspace clippy
+138 tests pass: 59 protocol, 78 server, one SSL3 integration. Workspace clippy
 with all targets and warnings denied passes, as do the release build and the
 offline config check.
 
 Tests cover the negotiation contract (per-source acknowledgement, shared-public
 -address fallback, lone-client failure, incomplete clients never paired),
 session pairing and rematch generations, result decoding and every outcome rule,
-refusal of unwatched or mis-stated matches, single-commit behaviour, encrypted
-registration and channels, persistent identity and records, concurrent duplicate
-outcomes, failed-write recovery, and both HTTP views.
+refusal of unwatched or mis-stated matches, one-sided and late reports counting
+for nobody, single-commit behaviour, encrypted
+registration and channels, persistent identity and records, concurrent sweeps of
+the pending-result queue, failed-write recovery, and both HTTP views.
 
 **None of this proves console acceptance of matchmaking or results.** The local
 tests drive the server's own state machine against synthetic clients.
@@ -96,9 +102,9 @@ tests drive the server's own state machine against synthetic clients.
 - A two-console run: challenge, match start, completion, rematch, abort,
   disconnect and logout. That run is what would establish the result path.
 - Whether the round counters reset per match or accumulate across a rematch is
-  not established from the code. Keying commits by server generation makes the
-  question moot for counting, but a cumulative counter would make the recorded
-  margin wrong; check it against a real report.
+  not established from the code. Per-pairing generations make the question moot
+  for counting, but a cumulative counter would make the recorded margin wrong;
+  check it against a real report.
 - Ranked versus private eligibility is unresolved. The title's result producer
   emits `game_type` 0 and `rank_mode` 1 for every match it sends, which are wire
   facts and not evidence that every match should count. Currently all accepted
@@ -111,9 +117,9 @@ tests drive the server's own state machine against synthetic clients.
 ## Local operations and evidence
 
 Optional TOML sections: `stats`, `natneg`, `gstats`, `identity`. Identity state
-must stay in ignored runtime storage or outside the public tree. The store caps profiles and
-duplicate markers at 10,000 each and refuses new results at capacity rather than
-silently dropping replay protection. `MKVSDCU_GP_TRACE_DIR` writes sensitive GPCM
+must stay in ignored runtime storage or outside the public tree. The store holds
+player rows only, capped at 10,000; it keeps no record of individual matches, so
+a decided result exists only as the counters it moved. `MKVSDCU_GP_TRACE_DIR` writes sensitive GPCM
 diagnostics and must also target ignored local storage.
 
 Durable ticket-derived profile IDs are implemented and extract identity without

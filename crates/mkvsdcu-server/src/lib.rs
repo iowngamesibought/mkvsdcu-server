@@ -34,10 +34,6 @@ use config::{CliCommand, Config};
 use session::AuthSessions;
 use tls::LegacyTls;
 
-/// Match generations reserved per start. A run would need more pairings than
-/// this to exhaust its block, and skipped numbers cost nothing.
-const GENERATION_BLOCK: u64 = 1_000_000;
-
 pub fn run() -> Result<(), String> {
     match config::parse_cli(env::args().skip(1))? {
         CliCommand::Help => {
@@ -83,17 +79,9 @@ fn run_server(path: &Path) -> Result<(), String> {
         )?),
         None => AuthSessions::new(),
     });
-    // Generations key the durable result markers, so they are reserved from
-    // the store rather than restarted in memory on every run.
-    let matches = Arc::new(match sessions.identity_store() {
-        Some(store) => {
-            let base = store.reserve_generations(GENERATION_BLOCK)?;
-            println!("[match] issuing generations from {base}");
-            matches::Matches::starting_at(base)
-        }
-        // Without durable records there is nothing to deduplicate against.
-        None => matches::Matches::new(),
-    });
+    // Generations identify a pairing only while this process is running:
+    // nothing durable is keyed by them, so the counter starts fresh.
+    let matches = Arc::new(matches::Matches::new());
     let generated = cert::generate_self_signed()?;
     let tls = Arc::new(LegacyTls::new(&generated.certificate, &generated.key)?);
 
